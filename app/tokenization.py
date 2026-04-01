@@ -289,6 +289,54 @@ class RewardEngine:
             db_session=db_session,
         )
 
+    # Miner tier multipliers (CLASS_F=1.5x, CLASS_G=1.25x, CLASS_H=1.0x)
+    MINER_MULTIPLIERS = {
+        "validator_miner": Decimal("1.5"),
+        "core_miner": Decimal("1.25"),
+        "miner": Decimal("1.0"),
+    }
+
+    async def reward_training_block(
+        self,
+        wallet_id: str,
+        miner_class: str,
+        base_reward: Decimal,
+        task_id: str,
+        samples_processed: int = 0,
+        loss_value: float = 0.0,
+        db_session: AsyncSession = None,
+    ) -> Dict[str, Any]:
+        """
+        Mint $RGT reward for a verified training block submission.
+        
+        Applies tier-aware multiplier:
+          CLASS_F (validator_miner) = 1.5x base reward
+          CLASS_G (core_miner)     = 1.25x base reward
+          CLASS_H (miner)          = 1.0x base reward
+        """
+        from .wallet import wallet_manager
+
+        multiplier = self.MINER_MULTIPLIERS.get(miner_class, Decimal("1.0"))
+        final_reward = base_reward * multiplier
+
+        tx = await wallet_manager.credit(
+            wallet_id=wallet_id,
+            amount=final_reward,
+            tx_type="reward",
+            description=f"Training block reward: task={task_id}, samples={samples_processed}, loss={loss_value:.4f}",
+            reference_type="training_block",
+            db_session=db_session,
+        )
+
+        return {
+            "transaction": tx,
+            "base_reward": base_reward,
+            "multiplier": multiplier,
+            "final_reward": final_reward,
+            "miner_class": miner_class,
+            "task_id": task_id,
+        }
+
 
 token_manager = TokenManager()
 reward_engine = RewardEngine()

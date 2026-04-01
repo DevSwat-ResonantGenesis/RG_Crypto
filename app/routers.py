@@ -738,6 +738,118 @@ async def get_miner_stats(
     )
 
 
+class MinerCreditRequest(BaseModel):
+    user_id: Optional[str] = None
+    email: Optional[str] = None
+    rgt_amount: float = 0
+    tasks_delta: int = 1
+    samples_delta: int = 0
+    trust_score: Optional[float] = None
+    tier: Optional[str] = None
+    gradient_hash: Optional[str] = None
+    task_id: Optional[str] = None
+    global_step: int = 0
+
+
+@router.post("/miner/credit")
+async def credit_miner(
+    payload: MinerCreditRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Internal endpoint: Mining service credits a miner after gradient accepted.
+    Updates MinerStats and wallet balance. Auth via X-Internal-Key or system role.
+    """
+    import os
+
+    # Auth: internal service key or system role
+    internal_key = os.getenv("AUTH_INTERNAL_SERVICE_KEY", "")
+    caller_key = request.headers.get("x-internal-key", "")
+    caller_role = request.headers.get("x-user-role", "")
+
+    if internal_key and caller_key == internal_key:
+        pass  # Internal service call — allowed
+    elif caller_role in ("system", "platform_dev", "platform_owner"):
+        pass  # System role — allowed
+    else:
+        raise HTTPException(status_code=403, detail="Internal service auth required")
+
+    # Resolve user_id — prefer direct user_id, fall back to email lookup
+    user_id = payload.user_id
+    if not user_id and payload.email:
+        # Look up user by email in auth DB (cross-service)
+        from sqlalchemy import text
+        row = await session.execute(
+            text("SELECT id FROM users WHERE email = :email LIMIT 1"),
+            {"email": payload.email},
+        )
+        result = row.first()
+        if result:
+            user_id = str(result[0])
+
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id or email required")
+
+    # Update or create MinerStats
+    result = await session.execute(
+        select(MinerStats).where(MinerStats.user_id == user_id)
+    )
+    stats = result.scalar_one_or_none()
+
+    if not stats:
+        wallet = await wallet_manager.get_wallet(user_id, session)
+        stats = MinerStats(
+            user_id=user_id,
+            wallet_id=str(wallet.id) if wallet else None,
+        )
+        session.add(stats)
+
+    # Accumulate stats
+    stats.rgt_earned = (stats.rgt_earned or Decimal("0")) + Decimal(str(payload.rgt_amount))
+    stats.tasks_completed = (stats.tasks_completed or 0) + payload.tasks_delta
+    stats.samples_processed = (stats.samples_processed or 0) + payload.samples_delta
+    stats.current_epoch = payload.global_step
+    stats.status = "active"
+    if payload.trust_score is not None:
+        stats.trust_score = payload.trust_score
+    if payload.tier:
+        stats.tier = payload.tier
+
+    await session.commit()
+    await session.refresh(stats)
+
+    # Also credit the wallet balance (actual $RGT)
+    if payload.rgt_amount > 0:
+        try:
+            wallet = await wallet_manager.get_wallet(user_id, session)
+            if not wallet:
+                wallet = await wallet_manager.create_wallet(user_id, session)
+            await wallet_manager.credit(
+                wallet_id=str(wallet.id),
+                amount=Decimal(str(payload.rgt_amount)),
+                tx_type="reward",
+                description=f"Mining reward: task {payload.task_id or 'unknown'}",
+                reference_type="mining",
+                metadata={
+                    "gradient_hash": payload.gradient_hash,
+                    "task_id": payload.task_id,
+                    "global_step": payload.global_step,
+                },
+                db_session=session,
+            )
+        except Exception as e:
+            logger.warning(f"Wallet credit failed for {user_id}: {e}")
+
+    return {
+        "status": "credited",
+        "user_id": user_id,
+        "rgt_earned": str(stats.rgt_earned),
+        "tasks_completed": stats.tasks_completed,
+        "samples_processed": stats.samples_processed,
+    }
+
+
 # ============== ML Memory Stats Endpoint ==============
 
 @router.get("/miner/ml-stats")
