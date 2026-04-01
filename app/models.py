@@ -253,3 +253,31 @@ class PaymentIntent(Base):
     
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class MinerStats(Base):
+    """Per-user miner dashboard statistics."""
+    __tablename__ = "miner_stats"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), unique=True, index=True, nullable=False)
+    wallet_id = Column(UUID(as_uuid=True), index=True, nullable=True)
+
+    # Core metrics
+    trust_score = Column(Float, default=0.0)
+    rgt_earned = Column(Numeric(precision=36, scale=18), default=0)
+    tasks_completed = Column(Integer, default=0)
+    samples_processed = Column(Integer, default=0)
+
+    # Classification
+    tier = Column(String(32), default="miner")  # validator_miner, core_miner, miner
+    verification_rate = Column(Float, default=0.0)
+    status = Column(String(16), default="idle")  # active, idle, suspended
+
+    # Network context
+    current_epoch = Column(Integer, default=0)
+    total_miners = Column(Integer, default=0)
+    your_rank = Column(Integer, default=0)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())

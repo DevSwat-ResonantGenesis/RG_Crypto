@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .db import get_session
 from .models import (
     Wallet, Transaction, Receipt, FundingSource,
-    WithdrawalRequest, PaymentIntent, TokenAllocation
+    WithdrawalRequest, PaymentIntent, TokenAllocation, MinerStats
 )
 from .wallet import wallet_manager, funding_manager
 from .tokenization import token_manager, reward_engine
@@ -681,6 +681,119 @@ async def reward_user(
         "tx_id": str(tx.id),
         "new_balance": str(wallet.token_balance),
     }
+
+
+# ============== Miner Stats Endpoints ==============
+
+class MinerStatsResponse(BaseModel):
+    trust_score: float
+    rgt_earned: str
+    tasks_completed: int
+    samples_processed: int
+    tier: str
+    verification_rate: float
+    status: str
+    current_epoch: int
+    total_miners: int
+    your_rank: int
+
+
+@router.get("/miner/stats", response_model=MinerStatsResponse)
+async def get_miner_stats(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    """Get the current user's miner dashboard stats."""
+    user_id = request.headers.get("x-user-id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    result = await session.execute(
+        select(MinerStats).where(MinerStats.user_id == user_id)
+    )
+    stats = result.scalar_one_or_none()
+
+    if not stats:
+        # Auto-create a default row for the user
+        wallet = await wallet_manager.get_wallet(user_id, session)
+        stats = MinerStats(
+            user_id=user_id,
+            wallet_id=str(wallet.id) if wallet else None,
+        )
+        session.add(stats)
+        await session.commit()
+        await session.refresh(stats)
+
+    return MinerStatsResponse(
+        trust_score=stats.trust_score or 0.0,
+        rgt_earned=str(stats.rgt_earned or 0),
+        tasks_completed=stats.tasks_completed or 0,
+        samples_processed=stats.samples_processed or 0,
+        tier=stats.tier or "miner",
+        verification_rate=stats.verification_rate or 0.0,
+        status=stats.status or "idle",
+        current_epoch=stats.current_epoch or 0,
+        total_miners=stats.total_miners or 0,
+        your_rank=stats.your_rank or 0,
+    )
+
+
+# ============== ML Memory Stats Endpoint ==============
+
+@router.get("/miner/ml-stats")
+async def get_ml_memory_stats(
+    request: Request,
+):
+    """Fetch training model stats from the ML memory database."""
+    import os
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession as _AS
+    from sqlalchemy.orm import sessionmaker as _sm
+    from sqlalchemy import text
+
+    user_id = request.headers.get("x-user-id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    ml_db_url = os.getenv("ML_DATABASE_URL", "")
+    if not ml_db_url:
+        return {
+            "connected": False,
+            "message": "ML_DATABASE_URL not configured",
+            "training_runs": 0,
+            "latest_loss": None,
+            "latest_epoch": None,
+        }
+
+    try:
+        ml_engine = create_async_engine(ml_db_url, pool_pre_ping=True)
+        _session_factory = _sm(ml_engine, class_=_AS, expire_on_commit=False)
+        async with _session_factory() as ml_session:
+            # Query latest training metrics for the user
+            row = await ml_session.execute(
+                text(
+                    "SELECT COUNT(*) as runs, "
+                    "MIN(loss) as best_loss, "
+                    "MAX(epoch) as latest_epoch "
+                    "FROM training_metrics "
+                    "WHERE user_id = :uid"
+                ),
+                {"uid": user_id},
+            )
+            r = row.mappings().first()
+            return {
+                "connected": True,
+                "training_runs": r["runs"] if r else 0,
+                "best_loss": float(r["best_loss"]) if r and r["best_loss"] else None,
+                "latest_epoch": int(r["latest_epoch"]) if r and r["latest_epoch"] else None,
+            }
+    except Exception as e:
+        return {
+            "connected": False,
+            "message": str(e),
+            "training_runs": 0,
+            "best_loss": None,
+            "latest_epoch": None,
+        }
 
 
 # ============== Health Endpoint ==============
