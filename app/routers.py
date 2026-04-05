@@ -3,10 +3,12 @@
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
+import re
+import uuid as _uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import get_session
@@ -101,7 +103,8 @@ class FundingSourceResponse(BaseModel):
 
 
 class TransferRequest(BaseModel):
-    to_user_id: str
+    to: str = Field(..., description="Recipient: email, user UUID, or crypto_hash")
+    to_user_id: Optional[str] = None  # legacy compat
     amount: float = Field(..., gt=0)
     description: Optional[str] = None
 
@@ -429,13 +432,55 @@ async def get_transaction(
 
 # ============== Transfer Endpoints ==============
 
+def _is_uuid(s: str) -> bool:
+    try:
+        _uuid.UUID(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_email(s: str) -> bool:
+    return bool(re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', s))
+
+
+def _is_crypto_hash(s: str) -> bool:
+    clean = s.lower().removeprefix('0x')
+    return len(clean) == 64 and all(c in '0123456789abcdef' for c in clean)
+
+
+async def _resolve_recipient_user_id(
+    identifier: str, session: AsyncSession
+) -> Optional[str]:
+    """Resolve email, crypto_hash, or UUID to a user_id string."""
+    identifier = identifier.strip()
+    if _is_uuid(identifier):
+        return identifier
+    if _is_email(identifier):
+        result = await session.execute(
+            text("SELECT id FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1"),
+            {"email": identifier},
+        )
+        row = result.fetchone()
+        return str(row[0]) if row else None
+    if _is_crypto_hash(identifier):
+        clean = identifier.lower().removeprefix('0x')
+        result = await session.execute(
+            text("SELECT id FROM users WHERE crypto_hash = :ch LIMIT 1"),
+            {"ch": clean},
+        )
+        row = result.fetchone()
+        return str(row[0]) if row else None
+    return None
+
+
 @router.post("/transfer")
 async def transfer_tokens(
     payload: TransferRequest,
     request: Request,
     session: AsyncSession = Depends(get_session),
 ):
-    """Transfer tokens to another user."""
+    """Transfer tokens to another user by email, user ID, or crypto_hash."""
     user_id = request.headers.get("x-user-id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Authentication required")
@@ -444,9 +489,24 @@ async def transfer_tokens(
     if not from_wallet:
         raise HTTPException(status_code=404, detail="Wallet not found")
 
-    to_wallet = await wallet_manager.get_wallet(payload.to_user_id, session)
+    # Resolve recipient: accept email, UUID, or crypto_hash
+    recipient_identifier = payload.to or payload.to_user_id
+    if not recipient_identifier:
+        raise HTTPException(status_code=400, detail="Recipient is required (email, user ID, or blockchain hash)")
+
+    to_user_id = await _resolve_recipient_user_id(recipient_identifier, session)
+    if not to_user_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Recipient not found. You can use an email address, user ID, or blockchain hash (0x...)."
+        )
+
+    if to_user_id == user_id:
+        raise HTTPException(status_code=400, detail="Cannot transfer to yourself")
+
+    to_wallet = await wallet_manager.get_wallet(to_user_id, session)
     if not to_wallet:
-        raise HTTPException(status_code=404, detail="Recipient wallet not found")
+        raise HTTPException(status_code=404, detail="Recipient has no wallet yet. They need to create one first.")
 
     try:
         debit_tx, credit_tx = await wallet_manager.transfer(
@@ -460,6 +520,7 @@ async def transfer_tokens(
             "status": "completed",
             "transaction_id": str(debit_tx.id),
             "amount": str(payload.amount),
+            "to_user_id": to_user_id,
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
