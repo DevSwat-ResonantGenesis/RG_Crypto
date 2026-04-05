@@ -1,5 +1,9 @@
 """Crypto Service API routers."""
 
+import hashlib
+import hmac as _hmac
+import logging
+import time as _time
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
@@ -14,8 +18,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .db import get_session
 from .models import (
     Wallet, Transaction, Receipt, FundingSource,
-    WithdrawalRequest, PaymentIntent, TokenAllocation, MinerStats
+    WithdrawalRequest, PaymentIntent, TokenAllocation, MinerStats, MiningCredit
 )
+
+logger = logging.getLogger(__name__)
 from .wallet import wallet_manager, funding_manager
 from .tokenization import token_manager, reward_engine
 from .payments import payment_processor, withdrawal_processor
@@ -810,6 +816,32 @@ class MinerCreditRequest(BaseModel):
     gradient_hash: Optional[str] = None
     task_id: Optional[str] = None
     global_step: int = 0
+    timestamp: Optional[int] = None
+    signature: Optional[str] = None
+
+
+# ── Proof-of-Training constants ──
+# Max $RGT that can be credited in a single call (Year-1 reward schedule)
+_MAX_REWARD_PER_CREDIT = 500.0
+# HMAC signature validity window (seconds) — reject stale requests
+_SIGNATURE_MAX_AGE = 300  # 5 minutes
+
+
+def _verify_credit_signature(
+    gradient_hash: str, user_id: str, rgt_amount: float,
+    timestamp: int, signature: str, internal_key: str,
+) -> bool:
+    """
+    Verify HMAC-SHA256 proof-of-training.
+    The mining service signs: "{gradient_hash}:{user_id}:{rgt_amount}:{timestamp}"
+    with the shared INTERNAL_SERVICE_KEY. This proves the credit request
+    originated from the mining service which actually verified the gradient.
+    """
+    msg = f"{gradient_hash}:{user_id}:{rgt_amount}:{timestamp}"
+    expected = _hmac.new(
+        internal_key.encode(), msg.encode(), hashlib.sha256,
+    ).hexdigest()
+    return _hmac.compare_digest(expected, signature)
 
 
 @router.post("/miner/credit")
@@ -820,27 +852,47 @@ async def credit_miner(
 ):
     """
     Internal endpoint: Mining service credits a miner after gradient accepted.
-    Updates MinerStats and wallet balance. Auth via X-Internal-Key or system role.
+
+    Security (proof-of-training, like Bitcoin's coinbase tx):
+      1. HMAC-SHA256 signature — only mining service can sign
+      2. Replay protection — each gradient_hash credited exactly once
+      3. Reward cap — max per-credit limit prevents inflation
+      4. Timestamp window — stale requests rejected
+      5. Internal key auth — only reachable within Docker network
     """
     import os
 
-    # Auth: internal service key or system role
     internal_key = os.getenv("AUTH_INTERNAL_SERVICE_KEY", "")
-    caller_key = request.headers.get("x-internal-key", "")
-    caller_role = request.headers.get("x-user-role", "")
 
-    if internal_key and caller_key == internal_key:
-        pass  # Internal service call — allowed
-    elif caller_role in ("system", "platform_dev", "platform_owner"):
-        pass  # System role — allowed
-    else:
+    # ── Layer 1: Internal service key auth ──
+    caller_key = request.headers.get("x-internal-key", "")
+    if not internal_key or caller_key != internal_key:
         raise HTTPException(status_code=403, detail="Internal service auth required")
 
-    # Resolve user_id — prefer direct user_id, fall back to email lookup
+    # ── Layer 2: Require gradient_hash (proof-of-training anchor) ──
+    if not payload.gradient_hash:
+        raise HTTPException(status_code=400, detail="gradient_hash required (proof-of-training)")
+
+    # ── Layer 3: Reward cap ──
+    if payload.rgt_amount <= 0:
+        raise HTTPException(status_code=400, detail="rgt_amount must be positive")
+    if payload.rgt_amount > _MAX_REWARD_PER_CREDIT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"rgt_amount {payload.rgt_amount} exceeds max {_MAX_REWARD_PER_CREDIT} per credit",
+        )
+
+    # ── Layer 4: HMAC signature verification ──
+    if not payload.signature or not payload.timestamp:
+        raise HTTPException(status_code=400, detail="signature and timestamp required")
+
+    now = int(_time.time())
+    if abs(now - payload.timestamp) > _SIGNATURE_MAX_AGE:
+        raise HTTPException(status_code=400, detail="Signature expired (timestamp too old)")
+
+    # Resolve user_id first (needed for signature verification)
     user_id = payload.user_id
     if not user_id and payload.email:
-        # Look up user by email in auth DB (cross-service)
-        from sqlalchemy import text
         row = await session.execute(
             text("SELECT id FROM users WHERE email = :email LIMIT 1"),
             {"email": payload.email},
@@ -851,6 +903,33 @@ async def credit_miner(
 
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id or email required")
+
+    if not _verify_credit_signature(
+        payload.gradient_hash, payload.user_id or "",
+        payload.rgt_amount, payload.timestamp,
+        payload.signature, internal_key,
+    ):
+        logger.warning(f"HMAC verification FAILED for gradient {payload.gradient_hash[:16]}...")
+        raise HTTPException(status_code=403, detail="Invalid proof-of-training signature")
+
+    # ── Layer 5: Replay protection — gradient_hash can only be credited ONCE ──
+    existing = await session.execute(
+        select(MiningCredit).where(MiningCredit.gradient_hash == payload.gradient_hash)
+    )
+    if existing.scalar_one_or_none():
+        logger.warning(f"Replay attempt blocked: gradient {payload.gradient_hash[:16]}... already credited")
+        raise HTTPException(status_code=409, detail="Gradient already credited (replay blocked)")
+
+    # ── All checks passed — record the credit in the ledger ──
+    credit_record = MiningCredit(
+        gradient_hash=payload.gradient_hash,
+        user_id=user_id,
+        rgt_amount=Decimal(str(payload.rgt_amount)),
+        task_id=payload.task_id,
+        global_step=payload.global_step,
+        hmac_signature=payload.signature,
+    )
+    session.add(credit_record)
 
     # Update or create MinerStats
     result = await session.execute(
@@ -877,30 +956,36 @@ async def credit_miner(
     if payload.tier:
         stats.tier = payload.tier
 
+    # Credit the wallet balance (actual $RGT)
+    try:
+        wallet = await wallet_manager.get_wallet(user_id, session)
+        if not wallet:
+            wallet = await wallet_manager.create_wallet(user_id, session)
+        await wallet_manager.credit(
+            wallet_id=str(wallet.id),
+            amount=Decimal(str(payload.rgt_amount)),
+            tx_type="reward",
+            description=f"Mining reward: task {payload.task_id or 'unknown'}",
+            reference_type="mining",
+            metadata={
+                "gradient_hash": payload.gradient_hash,
+                "task_id": payload.task_id,
+                "global_step": payload.global_step,
+                "hmac_verified": True,
+            },
+            db_session=session,
+        )
+    except Exception as e:
+        logger.error(f"Wallet credit failed for {user_id}: {e}")
+        raise HTTPException(status_code=500, detail="Wallet credit failed")
+
     await session.commit()
     await session.refresh(stats)
 
-    # Also credit the wallet balance (actual $RGT)
-    if payload.rgt_amount > 0:
-        try:
-            wallet = await wallet_manager.get_wallet(user_id, session)
-            if not wallet:
-                wallet = await wallet_manager.create_wallet(user_id, session)
-            await wallet_manager.credit(
-                wallet_id=str(wallet.id),
-                amount=Decimal(str(payload.rgt_amount)),
-                tx_type="reward",
-                description=f"Mining reward: task {payload.task_id or 'unknown'}",
-                reference_type="mining",
-                metadata={
-                    "gradient_hash": payload.gradient_hash,
-                    "task_id": payload.task_id,
-                    "global_step": payload.global_step,
-                },
-                db_session=session,
-            )
-        except Exception as e:
-            logger.warning(f"Wallet credit failed for {user_id}: {e}")
+    logger.info(
+        f"Mining credit: {payload.rgt_amount} RGT → {user_id} "
+        f"(gradient={payload.gradient_hash[:16]}..., step={payload.global_step})"
+    )
 
     return {
         "status": "credited",

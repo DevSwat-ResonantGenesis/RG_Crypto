@@ -255,6 +255,26 @@ class PaymentIntent(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class MiningCredit(Base):
+    """
+    Proof-of-training ledger — every credited gradient is recorded here.
+    Prevents replay attacks: each gradient_hash can only be credited ONCE.
+    Similar to Bitcoin's UTXO model where each coinbase reward is unique.
+    """
+    __tablename__ = "mining_credits"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    gradient_hash = Column(String(128), unique=True, index=True, nullable=False)
+    user_id = Column(UUID(as_uuid=True), index=True, nullable=False)
+    rgt_amount = Column(Numeric(precision=36, scale=18), nullable=False)
+    task_id = Column(String(128), nullable=True)
+    global_step = Column(Integer, default=0)
+    hmac_signature = Column(String(128), nullable=False)  # HMAC proof from mining service
+    chain_verified = Column(Boolean, default=False)  # Verified on external blockchain
+    chain_tx_hash = Column(String(128), nullable=True)  # Blockchain tx hash
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class MinerStats(Base):
     """Per-user miner dashboard statistics."""
     __tablename__ = "miner_stats"
